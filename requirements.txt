@@ -1,3 +1,260 @@
-requests>=2.31.0
-pytest>=8.0.0
-pyinstaller>=6.0.0
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import os
+from tkinter import END
+from typing import List, Optional
+
+import customtkinter as ctk
+
+from football_agent.agent import FootballAgent, MatchCandidate
+from football_agent.storage import MatchHistoryStore
+
+
+class FootballDesktopApp:
+    def __init__(self, root: ctk.CTk) -> None:
+        self.root = root
+        self.root.title("Meciuri AI — Smart Football Picks")
+        self.root.geometry("1280x760")
+        self.root.minsize(1100, 650)
+        self.root.configure(fg_color="#0b1020")
+
+        self.source_var = ctk.StringVar(value="sample")
+        self.min_prob_var = ctk.StringVar(value="0.70")
+        self.limit_var = ctk.StringVar(value="15")
+        self.league_var = ctk.StringVar(value="all")
+        self.goals_var = ctk.StringVar(value="all")
+        self.status_var = ctk.StringVar(value="În așteptare...")
+
+        self.matches_data: List[MatchCandidate] = []
+        self.history_store = MatchHistoryStore("meciuri_history.db")
+
+        self._configure_theme()
+        self._build_ui()
+        self.load_matches(auto=True)
+        self.root.after(45000, self._auto_refresh)
+
+    def _configure_theme(self) -> None:
+        ctk.set_appearance_mode("dark")
+        ctk.set_default_color_theme("blue")
+
+    def _build_ui(self) -> None:
+        top = ctk.CTkFrame(self.root, corner_radius=18, fg_color="#101827")
+        top.pack(fill="x", padx=18, pady=(18, 10))
+
+        ctk.CTkLabel(top, text="Meciuri AI", font=ctk.CTkFont(size=28, weight="bold")).grid(row=0, column=0, padx=18, pady=18, sticky="w")
+
+        controls = ctk.CTkFrame(top, fg_color="#0f172a")
+        controls.grid(row=1, column=0, columnspan=12, padx=16, pady=(0, 14), sticky="ew")
+
+        row = 0
+        ctk.CTkLabel(controls, text="Sursă").grid(row=row, column=0, padx=(12, 8), pady=12, sticky="w")
+        ctk.CTkComboBox(controls, variable=self.source_var, values=["sample", "api"], width=120).grid(row=row, column=1, padx=(0, 12), pady=12)
+
+        ctk.CTkLabel(controls, text="Prob. min").grid(row=row, column=2, padx=(0, 8), pady=12, sticky="w")
+        ctk.CTkEntry(controls, textvariable=self.min_prob_var, width=80).grid(row=row, column=3, padx=(0, 12), pady=12)
+
+        ctk.CTkLabel(controls, text="Limită").grid(row=row, column=4, padx=(0, 8), pady=12, sticky="w")
+        ctk.CTkEntry(controls, textvariable=self.limit_var, width=80).grid(row=row, column=5, padx=(0, 12), pady=12)
+
+        ctk.CTkLabel(controls, text="Ligă").grid(row=row, column=6, padx=(0, 8), pady=12, sticky="w")
+        ctk.CTkEntry(controls, textvariable=self.league_var, width=160).grid(row=row, column=7, padx=(0, 12), pady=12)
+
+        ctk.CTkLabel(controls, text="Goluri").grid(row=row, column=8, padx=(0, 8), pady=12, sticky="w")
+        ctk.CTkComboBox(
+            controls,
+            variable=self.goals_var,
+            values=["all", "Over 1.5", "Over 2.5", "BTTS Yes"],
+            width=120,
+        ).grid(row=row, column=9, padx=(0, 12), pady=12)
+
+        ctk.CTkButton(controls, text="Caută meciuri", command=self.load_matches, fg_color="#22c55e", hover_color="#16a34a", width=160).grid(row=row, column=10, padx=(0, 10), pady=12)
+        ctk.CTkButton(controls, text="Export CSV", command=self.export_csv, fg_color="#2563eb", hover_color="#1d4ed8", width=120).grid(row=row, column=11, padx=(0, 10), pady=12)
+
+        status = ctk.CTkFrame(top, fg_color="#0f172a")
+        status.grid(row=2, column=0, columnspan=12, sticky="ew", padx=16, pady=(0, 8))
+        ctk.CTkLabel(status, textvariable=self.status_var, anchor="w", padx=12, pady=8).pack(fill="x")
+
+        main = ctk.CTkFrame(self.root, fg_color="#0b1020")
+        main.pack(fill="both", expand=True, padx=18, pady=(0, 18))
+
+        left = ctk.CTkFrame(main, corner_radius=18, fg_color="#111827")
+        left.pack(side="left", fill="both", expand=True, padx=(0, 12))
+
+        self.tree = ctk.CTkTextbox(left, height=30, width=720, fg_color="#0b1220", text_color="#e2e8f0", border_width=1)
+        self.tree.pack(fill="both", expand=True, padx=12, pady=12)
+        self.tree.configure(state="disabled")
+
+        right = ctk.CTkFrame(main, width=360, corner_radius=18, fg_color="#111827")
+        right.pack(side="right", fill="y")
+
+        self.detail = ctk.CTkTextbox(right, height=22, width=350, fg_color="#0b1220", text_color="#e2e8f0", border_width=1)
+        self.detail.pack(fill="both", expand=True, padx=12, pady=(12, 8))
+        self.detail.configure(state="disabled")
+
+        ctk.CTkButton(right, text="Salvează meciul selectat", command=self.save_selected_match, fg_color="#a855f7", hover_color="#9333ea").pack(fill="x", padx=12, pady=(0, 8))
+
+        history_title = ctk.CTkLabel(right, text="Istoric", font=ctk.CTkFont(size=18, weight="bold"))
+        history_title.pack(anchor="w", padx=12, pady=(8, 6))
+
+        self.history_box = ctk.CTkTextbox(right, height=10, width=350, fg_color="#0b1220", text_color="#e2e8f0", border_width=1)
+        self.history_box.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+        self.history_box.configure(state="disabled")
+
+        self._render_history()
+
+    def _auto_refresh(self) -> None:
+        self.load_matches(auto=True)
+        self.root.after(45000, self._auto_refresh)
+
+    def load_matches(self, auto: bool = False) -> None:
+        try:
+            min_prob = float(self.min_prob_var.get())
+            limit = int(self.limit_var.get())
+        except ValueError:
+            self.status_var.set("Valori invalide pentru probabilitate sau limită.")
+            return
+
+        source = self.source_var.get()
+        league_filter = self.league_var.get().strip() or "all"
+        goals_filter = self.goals_var.get() if self.goals_var.get() != "all" else None
+
+        agent = FootballAgent(
+            source=source,
+            min_win_prob=min_prob,
+            league_filter=league_filter,
+            goals_market_filter=goals_filter,
+        )
+
+        self.matches_data = agent.find_matches(limit=limit)
+        self._render_matches()
+
+        if self.matches_data:
+            self._show_match_details(self.matches_data[0])
+            self.status_var.set(f"{len(self.matches_data)} meciuri găsite. Auto-refresh activ.")
+            self.history_store.save_snapshot([match.to_dict() for match in self.matches_data])
+        else:
+            self.status_var.set("Nu există meciuri care să respecte criteriile actuale.")
+            self._set_detail_text("Nu există meciuri care să respecte criteriile actuale.")
+
+    def _render_matches(self) -> None:
+        lines = []
+        for match in self.matches_data:
+            lines.append(
+                f"{match.league:>18} | {match.home_team:<18} vs {match.away_team:<18} | "
+                f"Win: {match.predicted_win_prob:.2%} | DC: {match.double_chance_odds:.2f} | {match.goals_market} | {match.confidence}"
+            )
+
+        text = "\n".join(lines) if lines else "Niciun meci disponibil."
+        self.tree.configure(state="normal")
+        self.tree.delete("1.0", END)
+        self.tree.insert(END, text)
+        self.tree.configure(state="disabled")
+
+    def _show_match_details(self, match: MatchCandidate) -> None:
+        text = (
+            f"Echipa gazdă: {match.home_team}\n"
+            f"Echipa oaspete: {match.away_team}\n"
+            f"Ligă: {match.league}\n"
+            f"Data: {match.kickoff}\n"
+            f"Probabilitate victorie: {match.predicted_win_prob:.2%}\n"
+            f"Double chance: {match.double_chance_odds:.2f}\n"
+            f"Goluri: {match.goals_market}\n"
+            f"Scor estimat: {match.score_prediction}\n"
+            f"Încredere: {match.confidence}\n\n"
+            f"Motiv: {match.reason}"
+        )
+        self._set_detail_text(text)
+
+    def _set_detail_text(self, text: str) -> None:
+        self.detail.configure(state="normal")
+        self.detail.delete("1.0", END)
+        self.detail.insert(END, text)
+        self.detail.configure(state="disabled")
+
+    def save_selected_match(self) -> None:
+        if not self.matches_data:
+            self.status_var.set("Nu există un meci selectat în listă.")
+            return
+
+        selected = self.matches_data[0]
+        self.history_store.save_selected(selected.to_dict())
+        self._render_history()
+        self.status_var.set(f"Meci salvat: {selected.home_team} vs {selected.away_team}")
+
+    def _render_history(self) -> None:
+        saved = self.history_store.get_saved_matches()
+        if not saved:
+            text = "Nu există meciuri salvate încă."
+        else:
+            lines = []
+            for match in saved[:10]:
+                lines.append(
+                    f"{match['home_team']} vs {match['away_team']} | {match['league']} | "
+                    f"{match['predicted_win_prob']:.2%} | {match['goals_market']}"
+                )
+            text = "\n".join(lines)
+
+        self.history_box.configure(state="normal")
+        self.history_box.delete("1.0", END)
+        self.history_box.insert(END, text)
+        self.history_box.configure(state="disabled")
+
+    def export_csv(self) -> None:
+        if not self.matches_data:
+            self.status_var.set("Nu există date de exportat.")
+            return
+
+        file_path = os.path.join(os.getcwd(), "meciuri_ai_export.csv")
+        fieldnames = [
+            "home_team",
+            "away_team",
+            "league",
+            "kickoff",
+            "predicted_win_prob",
+            "double_chance_odds",
+            "goals_market",
+            "confidence",
+            "reason",
+            "score_prediction",
+        ]
+
+        with open(file_path, "w", newline="", encoding="utf-8") as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer.writeheader()
+            for match in self.matches_data:
+                writer.writerow(match.to_dict())
+
+        self.status_var.set(f"Export CSV realizat: {file_path}")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Meciuri AI Desktop")
+    parser.add_argument("--cli", action="store_true")
+    parser.add_argument("--source", choices=["sample", "api"], default="sample")
+    parser.add_argument("--min-win-prob", type=float, default=0.70)
+    parser.add_argument("--limit", type=int, default=10)
+    parser.add_argument("--league", default="all")
+    parser.add_argument("--goals-market", choices=["all", "Over 1.5", "Over 2.5", "BTTS Yes"], default="all")
+    args = parser.parse_args()
+
+    if args.cli:
+        agent = FootballAgent(
+            source=args.source,
+            min_win_prob=args.min_win_prob,
+            league_filter=args.league,
+            goals_market_filter=args.goals_market if args.goals_market != "all" else None,
+        )
+        matches = agent.find_matches(limit=args.limit)
+        print(json.dumps([m.to_dict() for m in matches], ensure_ascii=False, indent=2))
+        return
+
+    app = ctk.CTk()
+    FootballDesktopApp(app)
+    app.mainloop()
+
+
+if __name__ == "__main__":
+    main()
